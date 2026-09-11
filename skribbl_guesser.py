@@ -8,6 +8,7 @@ import math
 import re
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import open_clip
 import torch
 from PIL import Image
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchWindowException, WebDriverException
+from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 
 MODEL = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
@@ -144,6 +145,7 @@ class Scorer:
         self.model.eval()
         self.tokenizer = open_clip.get_tokenizer(MODEL)
         self.bank = bank
+        self.text_cache = self.cache_path(bank.words)
         self.text = self.load_or_encode(bank.words)
         self.extra = self.load_or_encode(["fallback"] + bank.fallback, skip_first=True) if bank.fallback else None
         self.logit_scale = self.model.logit_scale.exp().item()
@@ -164,7 +166,11 @@ class Scorer:
 
     def add_words(self, new):
         self.text = torch.cat([self.text, self.encode(new)])
-        torch.save(self.text.cpu(), self.cache_path(self.bank.words))
+        cache = self.cache_path(self.bank.words)
+        torch.save(self.text.cpu(), cache)
+        if self.text_cache != cache and self.text_cache.exists():
+            self.text_cache.unlink()
+        self.text_cache = cache
 
     def autocast(self):
         if self.device == "cuda":
@@ -399,7 +405,7 @@ class Guesser:
             if m:
                 self.finish_round(m.group(1))
                 continue
-            if msg.endswith(" is drawing now!"):
+            if item["kind"] == "DRAWING" and msg.endswith(" is drawing now!"):
                 # Belt and braces: the hint bar hides between rounds and the
                 # answer line ends the round, but if either is missed this
                 # still prevents state carrying into the next drawer's turn.
@@ -437,12 +443,15 @@ class Guesser:
                 out = [i for i in out if all(edit_distance(pool[i], g) > 1 for g in far)]
             return out
 
-        cands = [(bank.words[i], self.scorer.text[i], True) for i in matches(bank.lower)]
+        # Each candidate is (word, source, ref, trusted); ref is a row index
+        # into the source matrix, or a tensor for compounds. Rows are gathered
+        # with index_select in gather_feats rather than stacked one by one.
+        cands = [(bank.words[i], "text", i, True) for i in matches(bank.lower)]
         # Fallback words are always scored. step() keeps only the strongest few
         # of them unless the confirmed pool is nearly exhausted, and they carry
         # a prior penalty, so a confirmed word at the same image score wins.
         if self.scorer.extra is not None:
-            cands += [(bank.fallback[i], self.scorer.extra[i], False)
+            cands += [(bank.fallback[i], "extra", i, False)
                       for i in matches(bank.fallback_lower) if bank.fallback_lower[i] not in bank.seen]
         if rnd.close:
             near = [c for c in cands if all(edit_distance(c[0].lower(), k) <= 1 for k in rnd.close)]
@@ -474,7 +483,19 @@ class Guesser:
         if new:
             for c, f in zip(new, self.scorer.encode(new, verbose=False)):
                 rnd.compounds[c] = f
-        return [(c, rnd.compounds[c], False) for c in combos if c in rnd.compounds]
+        return [(c, "comp", rnd.compounds[c], False) for c in combos if c in rnd.compounds]
+
+    def gather_feats(self, cands):
+        parts = []
+        for src, mat in (("text", self.scorer.text), ("extra", self.scorer.extra)):
+            idx = [ref for _, s, ref, _ in cands if s == src]
+            if idx:
+                parts.append(mat.index_select(0, torch.tensor(idx, device=mat.device)))
+        comp = [ref for _, s, ref, _ in cands if s == "comp"]
+        if comp:
+            parts.append(torch.stack(comp))
+        order = [c for c in cands if c[1] == "text"] + [c for c in cands if c[1] == "extra"] + [c for c in cands if c[1] == "comp"]
+        return torch.cat(parts), order
 
     def step(self, st):
         cfg, stats = self.cfg, self.stats
@@ -510,7 +531,7 @@ class Guesser:
             return
 
         cands = self.candidates()
-        trusted_n = sum(1 for c in cands if c[2])
+        trusted_n = sum(1 for c in cands if c[3])
         multiword = " " in rnd.pattern and trusted_n < cfg.fallback_min_trusted and self.scorer.extra is not None
         if not cands and not multiword:
             self.panel(meta="no candidates match")
@@ -522,8 +543,8 @@ class Guesser:
         if ink < cfg.min_ink_fraction:
             # Nothing drawn yet. Show the pool unsorted, or by the previous
             # scores if the drawer cleared the canvas mid-round.
-            share = dict(softmax_rank([(w, rnd.ema[w]) for w, _, _ in cands if w in rnd.ema]))
-            rows = [{"word": w, "p": share.get(w, 0.0), "sent": w in rnd.sent, "trusted": t} for w, _, t in cands]
+            share = dict(softmax_rank([(w, rnd.ema[w]) for w, _, _, _ in cands if w in rnd.ema]))
+            rows = [{"word": w, "p": share.get(w, 0.0), "sent": w in rnd.sent, "trusted": t} for w, _, _, t in cands]
             rows.sort(key=lambda c: (-c["trusted"], -c["p"]))
             self.panel(rows[:cfg.top_n], meta=f"{pool}, waiting for strokes")
             return
@@ -538,18 +559,19 @@ class Guesser:
             self.panel(meta="no candidates match")
             return
 
-        logits = self.scorer.score_feat(img, torch.stack([c[1] for c in cands]))
+        feats, cands = self.gather_feats(cands)
+        logits = self.scorer.score_feat(img, feats)
         rnd.frames += 1
         scored = list(zip(cands, logits))
         if trusted_n >= cfg.fallback_min_trusted:
-            loose = sorted((s for s in scored if not s[0][2]), key=lambda s: -s[1])[:cfg.fallback_keep]
-            scored = [s for s in scored if s[0][2]] + loose
+            loose = sorted((s for s in scored if not s[0][3]), key=lambda s: -s[1])[:cfg.fallback_keep]
+            scored = [s for s in scored if s[0][3]] + loose
         # Smooth the logits, not the probabilities: the softmax is taken over
         # whatever pool survives this frame, so smoothing after it would lag
         # every time hints or chat shrink the pool.
         log_prior = math.log(cfg.fallback_prior)
         trust = {}
-        for (w, _, t), l in scored:
+        for (w, _, _, t), l in scored:
             l = float(l) + (0.0 if t else log_prior)
             rnd.ema[w] = cfg.ema_alpha * l + (1 - cfg.ema_alpha) * rnd.ema.get(w, l)
             trust[w] = t
@@ -572,24 +594,46 @@ class Guesser:
             meta=f"{pool}, ink {ink:.1%}, {st['clock']}s left",
         )
 
+    def relaunch(self):
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+        try:
+            input("browser closed. press Enter to open a new one, or Ctrl+C to quit: ")
+        except (KeyboardInterrupt, EOFError):
+            print(file=sys.stderr)
+            return False
+        self.rnd = None
+        self.driver = self.launch()
+        return True
+
     def run(self):
         while True:
             time.sleep(self.cfg.poll_seconds)
             try:
-                st = self.driver.execute_script("return window.clipbot.read();")
+                # Navigating (clicking the logo, room change) wipes the
+                # injected script. Checked from the JS side so a missing
+                # object reads as a sentinel rather than a TypeError.
+                st = self.driver.execute_script("return window.clipbot ? window.clipbot.read() : 'missing';")
+                if st == "missing":
+                    self.inject(self.driver)
+                    continue
                 if st is not None:
                     self.step(st)
-            except NoSuchWindowException:
-                print("browser window closed, exiting", file=sys.stderr)
-                return
+            except (NoSuchWindowException, InvalidSessionIdException):
+                if not self.relaunch():
+                    return
             except WebDriverException as e:
-                # Navigating (clicking the logo, room change) wipes the
-                # injected script; re-inject. Anything else transient from
-                # the driver is logged and the next poll tries again.
-                if "clipbot" in str(e):
-                    self.inject(self.driver)
+                if "invalid session id" in str(e) or "not connected" in str(e):
+                    if not self.relaunch():
+                        return
                 else:
                     print(f"webdriver: {str(e).splitlines()[0]}", file=sys.stderr)
+            except Exception:
+                # A bad frame or an unexpected DOM shape should cost one
+                # poll, not the session.
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
