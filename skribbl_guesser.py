@@ -4,6 +4,7 @@ import hashlib
 import io
 import itertools
 import json
+import math
 import re
 import sys
 import time
@@ -15,6 +16,7 @@ import open_clip
 import torch
 from PIL import Image
 from selenium import webdriver
+from selenium.common.exceptions import NoSuchWindowException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 
 MODEL = "hf-hub:timm/ViT-SO400M-14-SigLIP-384"
@@ -65,7 +67,7 @@ class Config:
     fallback_keep: int = 5
     fallback_show_prob: float = 0.15
     compound_top: int = 8
-    spam_gap: float = 0.5
+    compound_encode_per_frame: int = 24
     block_ads: bool = True
     scale: float = 1.5
 
@@ -73,7 +75,6 @@ class Config:
 def parse_args():
     p = argparse.ArgumentParser(description="Zero-shot sketch recognition for skribbl.io")
     p.add_argument("--words", type=Path, default=Config.words_file, help="confirmed word list, one per line")
-    p.add_argument("--spam-gap", type=float, default=Config.spam_gap, help="seconds between guesses in spam mode")
     p.add_argument("--no-frames", action="store_true", help="do not save canvas frames")
     p.add_argument("--no-fallback", action="store_true", help="disable the wordfreq fallback list")
     p.add_argument("--ads", action="store_true", help="do not block ad networks")
@@ -81,7 +82,6 @@ def parse_args():
     a = p.parse_args()
     return Config(
         words_file=a.words,
-        spam_gap=a.spam_gap,
         save_frames=not a.no_frames,
         fallback_top_n=0 if a.no_fallback else Config.fallback_top_n,
         block_ads=not a.ads,
@@ -147,8 +147,6 @@ class Scorer:
         self.text = self.load_or_encode(bank.words)
         self.extra = self.load_or_encode(["fallback"] + bank.fallback, skip_first=True) if bank.fallback else None
         self.logit_scale = self.model.logit_scale.exp().item()
-        bias = getattr(self.model, "logit_bias", None)
-        self.logit_bias = bias.item() if bias is not None else 0.0
 
     @staticmethod
     def cache_path(words):
@@ -168,6 +166,11 @@ class Scorer:
         self.text = torch.cat([self.text, self.encode(new)])
         torch.save(self.text.cpu(), self.cache_path(self.bank.words))
 
+    def autocast(self):
+        if self.device == "cuda":
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        return torch.autocast("cpu", enabled=False)
+
     @torch.no_grad()
     def encode(self, words, verbose=True):
         out = []
@@ -176,7 +179,8 @@ class Scorer:
             feats = None
             for t in TEMPLATES:
                 tok = self.tokenizer([t.format(w) for w in chunk]).to(self.device)
-                f = self.model.encode_text(tok)
+                with self.autocast():
+                    f = self.model.encode_text(tok).float()
                 f = f / f.norm(dim=-1, keepdim=True)
                 feats = f if feats is None else feats + f
             out.append(feats / feats.norm(dim=-1, keepdim=True))
@@ -187,13 +191,15 @@ class Scorer:
     @torch.no_grad()
     def image_feat(self, image):
         x = self.preprocess(image).unsqueeze(0).to(self.device)
-        f = self.model.encode_image(x)
+        with self.autocast():
+            f = self.model.encode_image(x).float()
         return f / f.norm(dim=-1, keepdim=True)
 
     @torch.no_grad()
     def score_feat(self, img, feats):
-        logits = (img @ feats.T).squeeze(0) * self.logit_scale + self.logit_bias
-        return torch.softmax(logits, dim=0).float().cpu().numpy()
+        # Scaled cosine logits. SigLIP's logit_bias belongs to its sigmoid
+        # loss; under a softmax it is a constant shift and does nothing.
+        return ((img @ feats.T).squeeze(0) * self.logit_scale).float().cpu().numpy()
 
 
 def ink_fraction(image):
@@ -223,6 +229,16 @@ def pattern_regex(pattern):
     # rounds before this was tightened.
     body = "".join("[^ ]" if ch == "_" else re.escape(ch) for ch in pattern)
     return re.compile(f"^{body}$", re.IGNORECASE)
+
+
+def softmax_rank(items):
+    # items: [(word, logit)] -> [(word, share)] sorted by share.
+    if not items:
+        return []
+    m = max(l for _, l in items)
+    exp = [(w, math.exp(l - m)) for w, l in items]
+    total = sum(e for _, e in exp) or 1.0
+    return sorted(((w, e / total) for w, e in exp), key=lambda kv: -kv[1])
 
 
 @dataclass
@@ -258,7 +274,7 @@ class Round:
     close: guesses skribbl said were close, so the answer is one edit away.
     sent_at: when we sent each guess; a guess older than a second with no
     close reply means the answer is at least two edits away from it.
-    ema: per-word smoothed score so one stroke does not flip the ranking.
+    ema: per-word smoothed logit so one stroke does not flip the ranking.
     """
 
     def __init__(self, pattern):
@@ -343,6 +359,10 @@ class Guesser:
         if rnd is None:
             return
         answer = answer.strip()
+        if not answer:
+            self.push("round ended without an answer line")
+            self.rnd = None
+            return
         in_list = answer.lower() in self.bank.seen
         if answer and not in_list and self.bank.add(answer):
             self.scorer.add_words([answer])
@@ -378,6 +398,13 @@ class Guesser:
             m = re.match(r"^The word was '(.+)'$", msg)
             if m:
                 self.finish_round(m.group(1))
+                continue
+            if msg.endswith(" is drawing now!"):
+                # Belt and braces: the hint bar hides between rounds and the
+                # answer line ends the round, but if either is missed this
+                # still prevents state carrying into the next drawer's turn.
+                if self.rnd is not None:
+                    self.finish_round("")
                 continue
             rnd = self.rnd
             if rnd is None:
@@ -441,11 +468,13 @@ class Guesser:
             slots.append([bank.fallback[idx[i]] for i in np.argsort(-p)[:cfg.compound_top]])
         combos = [" ".join(c) for c in itertools.product(*slots)]
         combos = [c for c in combos if c.lower() not in bank.seen and c.lower() not in rnd.excluded]
-        new = [c for c in combos if c not in rnd.compounds]
+        # Encoding is bounded per frame so a churning ranking early in the
+        # round cannot blow the poll interval; stragglers land next poll.
+        new = [c for c in combos if c not in rnd.compounds][:cfg.compound_encode_per_frame]
         if new:
             for c, f in zip(new, self.scorer.encode(new, verbose=False)):
                 rnd.compounds[c] = f
-        return [(c, rnd.compounds[c], False) for c in combos]
+        return [(c, rnd.compounds[c], False) for c in combos if c in rnd.compounds]
 
     def step(self, st):
         cfg, stats = self.cfg, self.stats
@@ -491,16 +520,11 @@ class Guesser:
         image = Image.open(io.BytesIO(base64.b64decode(st["canvas"].split(",", 1)[1]))).convert("RGB")
         ink = ink_fraction(image)
         if ink < cfg.min_ink_fraction:
-            # Nothing drawn yet. Show the pool unsorted (or by last round's
-            # scores after a Clear). Spam mode still fires here, blind, so it
-            # is already working through the list before the first stroke.
-            rows = [{"word": w, "p": rnd.ema.get(w, 0.0), "sent": w in rnd.sent, "trusted": t} for w, _, t in cands]
+            # Nothing drawn yet. Show the pool unsorted, or by the previous
+            # scores if the drawer cleared the canvas mid-round.
+            share = dict(softmax_rank([(w, rnd.ema[w]) for w, _, _ in cands if w in rnd.ema]))
+            rows = [{"word": w, "p": share.get(w, 0.0), "sent": w in rnd.sent, "trusted": t} for w, _, t in cands]
             rows.sort(key=lambda c: (-c["trusted"], -c["p"]))
-            if st["mode"] == "spam" and time.time() - rnd.last_guess >= cfg.spam_gap:
-                for c in rows:
-                    if not c["sent"]:
-                        self.send(c["word"], "spam blind")
-                        break
             self.panel(rows[:cfg.top_n], meta=f"{pool}, waiting for strokes")
             return
 
@@ -514,36 +538,26 @@ class Guesser:
             self.panel(meta="no candidates match")
             return
 
-        # Softmax is taken over the current survivors only, so the shares
-        # renormalize on their own as hints and chat shrink the pool.
-        probs = self.scorer.score_feat(img, torch.stack([c[1] for c in cands]))
+        logits = self.scorer.score_feat(img, torch.stack([c[1] for c in cands]))
         rnd.frames += 1
-        scored = list(zip(cands, probs))
+        scored = list(zip(cands, logits))
         if trusted_n >= cfg.fallback_min_trusted:
             loose = sorted((s for s in scored if not s[0][2]), key=lambda s: -s[1])[:cfg.fallback_keep]
             scored = [s for s in scored if s[0][2]] + loose
+        # Smooth the logits, not the probabilities: the softmax is taken over
+        # whatever pool survives this frame, so smoothing after it would lag
+        # every time hints or chat shrink the pool.
+        log_prior = math.log(cfg.fallback_prior)
         trust = {}
-        for (w, _, t), p in scored:
-            p = float(p) * (1.0 if t else cfg.fallback_prior)
-            rnd.ema[w] = cfg.ema_alpha * p + (1 - cfg.ema_alpha) * rnd.ema.get(w, p)
+        for (w, _, t), l in scored:
+            l = float(l) + (0.0 if t else log_prior)
+            rnd.ema[w] = cfg.ema_alpha * l + (1 - cfg.ema_alpha) * rnd.ema.get(w, l)
             trust[w] = t
-        ranked = sorted(((w, rnd.ema[w]) for w in trust), key=lambda kv: -kv[1])
-        total = sum(p for _, p in ranked) or 1.0
-        ranked = [(w, p / total) for w, p in ranked]
+        ranked = softmax_rank([(w, rnd.ema[w]) for w in trust])
 
         if cfg.save_frames and rnd.frames % 5 == 0:
             top = re.sub(r"[^a-z0-9]", "_", ranked[0][0].lower())
             image.save(cfg.frames_dir / f"pending_{rnd.start:.0f}_{rnd.frames:03d}_{top}.png")
-
-        # Spam mode: one guess per spam_gap, always the best remaining word.
-        # Sent words are excluded for the round, so this sweeps the ranking.
-        # skribbl kicks for chat floods; 0.5 s survives in testing, faster
-        # has not.
-        if st["mode"] == "spam" and time.time() - rnd.last_guess >= cfg.spam_gap:
-            for w, p in ranked:
-                if w not in rnd.sent:
-                    self.send(w, f"spam {p:.0%}")
-                    break
 
         # Confirmed words are pinned: every one is shown up to the row cap, and
         # fallback words only fill leftover slots. Without this a large
@@ -563,15 +577,19 @@ class Guesser:
             time.sleep(self.cfg.poll_seconds)
             try:
                 st = self.driver.execute_script("return window.clipbot.read();")
-            except Exception as e:
+                if st is not None:
+                    self.step(st)
+            except NoSuchWindowException:
+                print("browser window closed, exiting", file=sys.stderr)
+                return
+            except WebDriverException as e:
                 # Navigating (clicking the logo, room change) wipes the
-                # injected script; re-inject and carry on.
+                # injected script; re-inject. Anything else transient from
+                # the driver is logged and the next poll tries again.
                 if "clipbot" in str(e):
                     self.inject(self.driver)
-                    continue
-                raise
-            if st is not None:
-                self.step(st)
+                else:
+                    print(f"webdriver: {str(e).splitlines()[0]}", file=sys.stderr)
 
 
 if __name__ == "__main__":
