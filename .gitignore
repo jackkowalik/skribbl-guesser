@@ -1,0 +1,5 @@
+chrome-profile/
+frames/
+rounds.jsonl
+text_cache_*.pt
+__pycache__/
