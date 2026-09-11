@@ -2,7 +2,7 @@
 
 Real-time sketch recognition for [skribbl.io](https://skribbl.io), running locally on your GPU!
 
-It opens skribbl.io in Chrome, watches the canvas and the hint bar, narrows the word list to what can still fit, and ranks the remaining words against the drawing with SigLIP. A panel in the page shows the ranking; click a word to send it. Every round is logged, so precision, recall, and time to solve accumulate across a session.
+It opens skribbl.io in Chrome, watches the canvas and the hint bar, narrows the word list to what can still fit, and ranks the remaining words against the drawing with SigLIP. A panel in the page shows the ranking; click a word to send it. Every round is logged, so precision, recall, and time to solve accumulate across a session. I've been able to get 5k-7k points in each game using this tool. 
 
 https://github.com/user-attachments/assets/fb6f9548-fd66-4825-a5bf-4929756793f1
 
