@@ -167,6 +167,12 @@
     };
   }
 
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
   const bot = {
     queue: [],
     chatBuf: [],
@@ -299,7 +305,7 @@
         const tr = document.createElement('tr');
         tr.className = 'cb-cand' + (c.sent ? ' cb-sent' : '') + (c.trusted === false ? ' cb-loose' : '');
         if (!c.sent) tr.dataset.word = c.word;
-        tr.innerHTML = '<td>' + c.word + '<div class="cb-bar" style="width:' + Math.round(c.p * 100) + '%"></div></td>' +
+        tr.innerHTML = '<td>' + esc(c.word) + '<div class="cb-bar" style="width:' + Math.round(c.p * 100) + '%"></div></td>' +
                        '<td class="cb-p">' + (c.p * 100).toFixed(1) + '%</td>';
         el.cands.appendChild(tr);
       });
@@ -309,7 +315,7 @@
         const chip = document.createElement('span');
         chip.className = 'cb-chip' + (c.sent ? ' cb-sent' : '') + (c.trusted === false ? ' cb-loose' : '');
         if (!c.sent) chip.dataset.word = c.word;
-        chip.innerHTML = c.word + '<small>' + Math.round(c.p * 100) + '%</small>';
+        chip.innerHTML = esc(c.word) + '<small>' + Math.round(c.p * 100) + '%</small>';
         dock.appendChild(chip);
       });
       bot.applyLayout();
@@ -317,11 +323,11 @@
       el.stats.innerHTML = '';
       Object.keys(data.stats || {}).forEach(function (k) {
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td>' + k + '</td><td>' + data.stats[k] + '</td>';
+        tr.innerHTML = '<td>' + esc(k) + '</td><td>' + esc(data.stats[k]) + '</td>';
         el.stats.appendChild(tr);
       });
 
-      if (data.log) el.log.innerHTML = data.log.map(function (l) { return '<div>' + l + '</div>'; }).join('');
+      if (data.log) el.log.innerHTML = data.log.map(function (l) { return '<div>' + esc(l) + '</div>'; }).join('');
     }
   };
 
