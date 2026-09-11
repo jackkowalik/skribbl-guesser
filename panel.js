@@ -54,6 +54,7 @@
     }
     #clipbot .cb-meta { opacity: 0.7; margin-top: 4px; font-size: 12px; }
     #clipbot table { width: 100%; border-collapse: collapse; }
+    #clipbot .cb-cands-wrap { max-height: 320px; overflow-y: auto; }
     #clipbot td { padding: 4px 4px; vertical-align: middle; }
     #clipbot tr:nth-child(odd) td { background: rgba(0, 0, 0, 0.04); }
     #clipbot tr.cb-cand { cursor: pointer; }
@@ -110,7 +111,7 @@
     </div>
     <div class="cb-section cb-cands-section">
       <div class="cb-title">Candidates</div>
-      <table class="cb-cands"></table>
+      <div class="cb-cands-wrap"><table class="cb-cands"></table></div>
     </div>
     <div class="cb-section">
       <div class="cb-title">Session record</div>
@@ -121,6 +122,7 @@
       <div class="cb-log"></div>
     </div>
   `;
+
   // Mount inside #game-chat when it exists so the panel takes the lower half
   // of the chat column; fall back to floating over the page otherwise.
   function mount() {
@@ -181,7 +183,7 @@
 
     // Chrome's CSS zoom scales layout and upsamples the canvas, and skribbl
     // maps pointer input through the canvas bounding rect, so drawing still
-    // works at any scale.
+    // works at any scale. The panel is inside #game so it scales with it.
     setScale: function (s) {
       const g = document.getElementById('game');
       if (g) g.style.zoom = s;
@@ -189,17 +191,20 @@
     },
 
     // Sit directly under the canvas, matching its width, so the chips wrap
-    // into two rows right where the eye already is.
+    // into two rows right where the eye already is. Before a game #game is
+    // display:none and the canvas rect is all zeros, so hide until it has size.
     placeDock: function () {
       const c = document.querySelector('#game-canvas');
       if (!c || !dock.classList.contains('cb-show')) return;
       const r = c.getBoundingClientRect();
+      dock.style.visibility = r.width > 0 ? 'visible' : 'hidden';
+      if (r.width === 0) return;
       dock.style.left = r.left + 'px';
       dock.style.width = r.width + 'px';
       dock.style.top = (r.bottom + 14) + 'px';
     },
 
-    // Two seconds of CSS confetti on a correct guess.
+    // A few seconds of CSS confetti in skribbl's palette colors.
     celebrate: function () {
       const colors = ['#ef130b', '#ff7100', '#ffe400', '#00cc00', '#00b2ff', '#231fd3', '#a300ba'];
       for (let i = 0; i < 140; i++) {
