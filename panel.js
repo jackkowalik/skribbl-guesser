@@ -168,7 +168,6 @@
   }
 
   const bot = {
-    mode: 'manual',
     queue: [],
     chatBuf: [],
 
@@ -271,7 +270,7 @@
 
       return {
         pattern: pattern, drawing: drawing, revealVisible: revealVisible, revealWord: revealWord.trim(),
-        chat: bot.chatBuf.splice(0), clock: clock, canvas: canvas, mode: bot.mode,
+        chat: bot.chatBuf.splice(0), clock: clock, canvas: canvas,
         queue: bot.queue.splice(0), me: bot.myName()
       };
     },
