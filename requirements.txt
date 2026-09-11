@@ -1,0 +1,5 @@
+open_clip_torch>=2.24
+selenium>=4.6
+pillow
+numpy
+wordfreq
